@@ -1,0 +1,47 @@
+name: Run Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # backup: agar chain toot jaye to har 6 ghante me dobara start
+
+# Ek hi time pe ek hi bot chale (do instance same token pe chalne se conflict hota hai).
+# Naya run purane ke khatam hone tak queue me wait karega.
+concurrency:
+  group: rarebot
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 5h 30m baad agla run trigger hota hai; wo queue me ruka rahega
+      # jab tak ye run 5h 45m pe khatam na ho. Isse gap bahut kam rehta hai.
+      - name: Schedule next run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nohup bash -c 'sleep 19800; gh workflow run bot.yml --repo "$GITHUB_REPOSITORY"' >/dev/null 2>&1 &
+
+      - name: Start bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WORK_DIR: ${{ runner.temp }}/work
+        run: timeout --signal=SIGINT 20700 python bot.py || true
