@@ -2,19 +2,43 @@ name: run-bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"   # bot band ho jaye to naya run utha deta hai
+    - cron: "*/15 * * * *"   # safety net: koi run na chal raha ho to naya utha deta hai
 
 permissions:
   contents: read
+  actions: write             # agla run dispatch karne ke liye zaroori
 
-concurrency:
-  group: toonflix-bot
-  cancel-in-progress: false
+# NOTE: concurrency group jaan-boojh kar hata diya hai, taaki purana aur naya run
+# ~1 ghante tak ek saath chal sakein (handover).
 
 jobs:
-  run:
+  guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 2
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          others=$(gh run list --workflow main.yml --status in_progress --limit 30 \
+            --json databaseId --jq "[.[] | select(.databaseId != $RUN_ID)] | length" 2>/dev/null)
+          others=${others:-0}
+          echo "Event=$EVENT, doosre chalte runs=$others"
+          go=true
+          if [ "$EVENT" = "schedule" ] && [ "$others" -ge 1 ]; then go=false; fi   # cron: koi chal raha hai to skip
+          if [ "$EVENT" != "schedule" ] && [ "$others" -ge 3 ]; then go=false; fi  # runaway se bachao
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,15 +52,23 @@ jobs:
           chmod +x cloudflared
           nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > tunnel.log 2>&1 &
           for i in $(seq 1 30); do
-            URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
+            URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | grep -v '^https://api\.' | head -1)
             [ -n "$URL" ] && break
             sleep 2
           done
           [ -z "$URL" ] && { echo "Tunnel URL nahi mila"; cat tunnel.log; exit 1; }
           echo "ORIGIN_URL=$URL" >> $GITHUB_ENV
-      - name: Run bot (crash par same run me restart)
+      - name: Run bot (crash par same run me restart + 1 ghante pehle handover)
         run: |
           set +e
+          # ~290 min baad agla run start karo -> purana run 355 min par band hoga => ~1 ghanta overlap
+          nohup bash -c '
+            sleep 17400
+            for t in 1 2 3; do
+              gh workflow run main.yml && { echo "Handover: agla run start ho gaya"; break; }
+              sleep 20
+            done
+          ' > handover.log 2>&1 &
           for i in $(seq 1 20); do
             python main.py
             code=$?
@@ -46,6 +78,8 @@ jobs:
           done
           exit 1
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
